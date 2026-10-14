@@ -1,6 +1,6 @@
 #define BLYNK_PRINT Serial
 
-#define BLYNK_FIRMWARE_VERSION "1.1.1"
+#define BLYNK_FIRMWARE_VERSION "1.1.3"
 
 #define BLYNK_TIMEOUT_MS 6000UL
 
@@ -86,7 +86,7 @@ static constexpr uint8_t BMP280_ADDR_2 = 0x77;
 
 static constexpr uint32_t WIFI_NO_CONNECTION_AP_MS = 30000UL;
 
-static constexpr uint32_t WIFI_RECONNECT_MS = 15000UL;
+static constexpr uint32_t WIFI_RECONNECT_MS = 7000UL; // Thời gian thử mỗi mạng Wi-Fi
 
 static constexpr uint32_t BLYNK_RECONNECT_MS = 5000UL;
 static constexpr uint32_t BLYNK_MAINTENANCE_INTERVAL_MS =
@@ -127,6 +127,35 @@ static constexpr uint64_t MANUAL_DEEP_SLEEP_US =
 static constexpr char AP_SSID[] = "SmartMonitor-Setup";
 
 static constexpr char AP_PASSWORD[] = ""; // Open setup AP
+
+// ================================================================
+// Wi-Fi mặc định đã được cấu hình theo thông tin bạn cung cấp.
+// Mạng thứ ba để trống vì hiện chưa có SSID/mật khẩu thứ ba.
+// Lưu ý: thông tin này được biên dịch vào firmware, không phải mã hóa.
+// ================================================================
+struct DefaultWiFiNetwork {
+  const char* ssid;
+  const char* password;
+};
+
+static const DefaultWiFiNetwork DEFAULT_WIFI_NETWORKS[] = {
+  {"", ""},
+  {"",""},
+  {"",""}
+};
+
+static constexpr uint8_t DEFAULT_WIFI_NETWORK_COUNT =
+    sizeof(DEFAULT_WIFI_NETWORKS) / sizeof(DEFAULT_WIFI_NETWORKS[0]);
+static constexpr uint8_t MAX_WIFI_CANDIDATES = DEFAULT_WIFI_NETWORK_COUNT + 1;
+
+struct WiFiCandidate {
+  String ssid;
+  String password;
+};
+
+static WiFiCandidate wifiCandidates[MAX_WIFI_CANDIDATES];
+static uint8_t wifiCandidateCount = 0;
+static uint8_t wifiCandidateIndex = 0;
 
 static constexpr char WIFI_PREF_NAMESPACE[] = "wifi_cfg";
 
@@ -951,7 +980,9 @@ static void drawDetailsPage() {
 
   oledHeader("WIFI DETAILS");
 
-  String ssid = savedWiFiSSID;
+  const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+  const String connectedSSID = wifiConnected ? WiFi.SSID() : String("");
+  const String ssid = wifiConnected ? connectedSSID : savedWiFiSSID;
 
   display.setCursor(0, 12);
 
@@ -965,7 +996,17 @@ static void drawDetailsPage() {
 
   display.print(F("PASS: "));
 
-  display.println(savedWiFiPassword.length() ? F("(saved)") : F("(open)"));
+  if (wifiConnected && connectedSSID != savedWiFiSSID) {
+    display.println(F("(firmware)"));
+  } else if (savedWiFiPassword.length() > 0) {
+    display.println(F("(saved)"));
+  } else if (savedWiFiSSID.length() > 0) {
+    display.println(F("(open)"));
+  } else if (wifiConnected) {
+    display.println(F("(firmware)"));
+  } else {
+    display.println(F("(not connected)"));
+  }
 
   display.setCursor(0, 38);
 
@@ -1252,413 +1293,339 @@ static void serviceMainPageRotation() {
 }
 
 // ================================================================
-
-// Wi-Fi credentials and WiFiManager portal
-
+// Wi-Fi credentials, candidate failover and WiFiManager portal
 // ================================================================
 
-static bool saveWiFiCredentialsToNVS(const String& ssid, const String& password) {
+static bool isUsableWiFiSSID(const String& ssid) {
+  if (ssid.length() == 0) return false;
 
-  if (ssid.length() == 0) {
-
-    Serial.println(F("Cannot save WiFi: SSID is empty."));
-
+  // Do not try the template placeholders as real network names.
+  if (ssid == "REPLACE_WITH_WIFI_1_SSID" ||
+      ssid == "REPLACE_WITH_WIFI_2_SSID" ||
+      ssid == "REPLACE_WITH_WIFI_3_SSID" ||
+      ssid.startsWith("REPLACE_WITH_")) {
     return false;
+  }
 
+  return true;
+}
+
+static void addWiFiCandidate(const String& ssid, const String& password) {
+  if (!isUsableWiFiSSID(ssid)) return;
+
+  // Keep one entry per SSID. A password already saved through the portal
+  // takes priority over a duplicate SSID in the compiled defaults.
+  for (uint8_t i = 0; i < wifiCandidateCount; ++i) {
+    if (wifiCandidates[i].ssid == ssid) return;
+  }
+
+  if (wifiCandidateCount >= MAX_WIFI_CANDIDATES) return;
+
+  wifiCandidates[wifiCandidateCount].ssid = ssid;
+  wifiCandidates[wifiCandidateCount].password = password;
+  ++wifiCandidateCount;
+}
+
+static void rebuildWiFiCandidateList() {
+  wifiCandidateCount = 0;
+  wifiCandidateIndex = 0;
+
+  // First priority: the most recently saved Wi-Fi configuration from NVS.
+  addWiFiCandidate(savedWiFiSSID, savedWiFiPassword);
+
+  // Then try the three networks compiled into this firmware.
+  for (uint8_t i = 0; i < DEFAULT_WIFI_NETWORK_COUNT; ++i) {
+    const String defaultSSID = DEFAULT_WIFI_NETWORKS[i].ssid;
+    const String defaultPassword = DEFAULT_WIFI_NETWORKS[i].password;
+
+    // Skip an entry if its password placeholder was not replaced. An empty
+    // password is still allowed for a genuinely open Wi-Fi network.
+    if (defaultPassword.startsWith("REPLACE_WITH_")) continue;
+
+    addWiFiCandidate(defaultSSID, defaultPassword);
+  }
+
+  Serial.print(F("Wi-Fi candidates available: "));
+  Serial.println(wifiCandidateCount);
+}
+
+static void selectWiFiCandidateBySSID(const String& ssid) {
+  for (uint8_t i = 0; i < wifiCandidateCount; ++i) {
+    if (wifiCandidates[i].ssid == ssid) {
+      wifiCandidateIndex = i;
+      return;
+    }
+  }
+}
+
+static bool saveWiFiCredentialsToNVS(const String& ssid, const String& password) {
+  if (ssid.length() == 0) {
+    Serial.println(F("Cannot save WiFi: SSID is empty."));
+    return false;
   }
 
   if (!wifiPreferences.begin(WIFI_PREF_NAMESPACE, false)) {
-
     Serial.println(F("Cannot open WiFi Preferences namespace."));
-
     return false;
-
   }
 
   const size_t ssidWritten = wifiPreferences.putString(WIFI_PREF_SSID_KEY, ssid);
-
   const size_t passWritten = wifiPreferences.putString(WIFI_PREF_PASS_KEY, password);
-
   wifiPreferences.end();
 
   if (ssidWritten == 0 || (password.length() > 0 && passWritten == 0)) {
-
     Serial.println(F("WiFi credentials could not be written to NVS."));
-
     return false;
-
   }
 
   savedWiFiSSID = ssid;
-
   savedWiFiPassword = password;
-
   wifiCredentialsAreSaved = true;
 
   Serial.print(F("WiFi credentials saved. SSID="));
-
   Serial.println(savedWiFiSSID);
-
   return true;
-
 }
 
 static bool loadWiFiCredentialsFromNVS() {
-
   savedWiFiSSID = "";
-
   savedWiFiPassword = "";
 
   if (wifiPreferences.begin(WIFI_PREF_NAMESPACE, true)) {
-
     savedWiFiSSID = wifiPreferences.getString(WIFI_PREF_SSID_KEY, "");
-
     savedWiFiPassword = wifiPreferences.getString(WIFI_PREF_PASS_KEY, "");
-
     wifiPreferences.end();
-
   }
 
-  if (savedWiFiSSID.length() > 0) {
+  // Keep compatibility with WiFiManager credentials from older firmware.
+  if (savedWiFiSSID.length() == 0) {
+    const String wmSSID = wifiManager.getWiFiSSID(true);
+    const String wmPassword = wifiManager.getWiFiPass(true);
 
-    wifiCredentialsAreSaved = true;
+    if (wmSSID.length() > 0) {
+      Serial.println(F("Migrating WiFiManager credentials to application NVS."));
+      saveWiFiCredentialsToNVS(wmSSID, wmPassword);
+    }
+  }
 
-    Serial.print(F("Found application WiFi credentials. SSID="));
+  wifiCredentialsAreSaved = savedWiFiSSID.length() > 0;
+  rebuildWiFiCandidateList();
 
-    Serial.println(savedWiFiSSID);
-
+  if (wifiCandidateCount > 0) {
+    if (savedWiFiSSID.length() > 0) {
+      Serial.print(F("Found saved WiFi credentials. SSID="));
+      Serial.println(savedWiFiSSID);
+    } else {
+      Serial.println(F("No custom WiFi credentials in NVS; using compiled defaults."));
+    }
     return true;
-
   }
 
-  const String wmSSID = wifiManager.getWiFiSSID(true);
-
-  const String wmPassword = wifiManager.getWiFiPass(true);
-
-  if (wmSSID.length() > 0) {
-
-    Serial.println(F("Migrating WiFiManager credentials to application NVS."));
-
-    return saveWiFiCredentialsToNVS(wmSSID, wmPassword);
-
-  }
-
-  wifiCredentialsAreSaved = false;
-
-  Serial.println(F("No saved WiFi credentials found."));
-
+  Serial.println(F("No usable WiFi credentials found."));
   return false;
-
 }
 
 static void onWiFiManagerAPStart(WiFiManager* manager) {
-
   (void)manager;
-
   configPortalActive = true;
-
   showAPPortalScreen();
 
   Serial.println();
-
   Serial.println(F("=== WiFi provisioning AP active ==="));
-
   Serial.print(F("SSID: "));
-
   Serial.println(AP_SSID);
-
   Serial.print(F("IP: "));
-
   Serial.println(WiFi.softAPIP());
-
 }
 
 static void onWiFiManagerSave() {
-
+  // WiFiManager invokes this callback after a successful connection
+  // (unless configured to break after saving on failure).
   const String ssid = wifiManager.getWiFiSSID(true);
-
   const String password = wifiManager.getWiFiPass(true);
 
   if (saveWiFiCredentialsToNVS(ssid, password)) {
-
-    Serial.println(F("New WiFi credentials saved."));
-
+    rebuildWiFiCandidateList();
+    Serial.println(F("New WiFi credentials saved after successful connection."));
   } else {
-
     Serial.println(F("Saving new WiFi credentials failed."));
-
   }
-
 }
 
 static void configureWiFiManager() {
-
   wifiManager.setConfigPortalBlocking(false);
-
   wifiManager.setConfigPortalTimeout(0);
-
   wifiManager.setAPClientCheck(false);
-
   wifiManager.setWebPortalClientCheck(true);
-
   wifiManager.setShowPassword(false);
-
   wifiManager.setDebugOutput(false);
-
   wifiManager.setAPCallback(onWiFiManagerAPStart);
-
   wifiManager.setSaveConfigCallback(onWiFiManagerSave);
-
 }
 
 static void startProvisioningPortal() {
-
   if (configPortalActive) return;
 
-  Serial.println(F("Starting SmartMonitor-Setup AP and WiFi configuration portal."));
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(F("Skipping WiFi portal start: station is already connected."));
+    return;
+  }
 
+  Serial.println(F("Starting SmartMonitor-Setup AP and WiFi configuration portal."));
   configureWiFiManager();
 
-  // AP+STA lets the setup AP remain active while the station retries Wi-Fi.
-
+  // Keep the setup AP active while WiFiManager processes submitted credentials.
+  // IMPORTANT: do not call WiFi.begin() from our retry logic while this portal runs.
   WiFi.mode(WIFI_AP_STA);
-
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-
   wifiManager.startConfigPortal(AP_SSID, AP_PASSWORD);
-
   configPortalActive = wifiManager.getConfigPortalActive();
 
   if (configPortalActive) {
-
     showAPPortalScreen();
-
   } else {
-
     Serial.println(F("WiFi setup portal did not start; retry will be scheduled."));
-
   }
-
 }
 
 static void onWiFiConnected() {
-
-  const bool hadSavedCredentials = wifiCredentialsAreSaved;
-
   const String connectedSSID = WiFi.SSID();
 
-  wifiCredentialsAreSaved = connectedSSID.length() > 0;
-
   Serial.println();
-
   Serial.println(F("WiFi connected."));
-
   Serial.print(F("SSID: "));
-
   Serial.println(connectedSSID);
-
   Serial.print(F("IP: "));
-
   Serial.println(WiFi.localIP());
-
   Serial.print(F("RSSI: "));
-
   Serial.print(WiFi.RSSI());
-
   Serial.println(F(" dBm"));
 
-  if (connectedSSID.length() > 0 &&
-
-      (savedWiFiSSID != connectedSSID || !hadSavedCredentials)) {
-
-    const String currentPassword = wifiManager.getWiFiPass(true);
-
-    if (currentPassword.length() > 0) {
-
-      saveWiFiCredentialsToNVS(connectedSSID, currentPassword);
-
-    }
-
-  }
+  // Do not read a possibly stale password from WiFiManager and save it under
+  // another SSID. Portal credentials are saved only by onWiFiManagerSave().
+  wifiCredentialsAreSaved = savedWiFiSSID.length() > 0;
+  selectWiFiCandidateBySSID(connectedSSID);
 
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-
   wifiEverConnected = true;
-
   clearWiFiOfflineTimer();
 
   if (!ntpClient.isTimeSet()) ntpClient.begin();
-
   ntpClient.update();
 
   if (!blynkConfigured) {
-
     Blynk.config(BLYNK_AUTH_TOKEN, "blynk.cloud", 443);
-
     blynkConfigured = true;
-
   }
 
   lastBlynkReconnectMs = 0;
-
   nextBlynkSendMs = millis() + 1000UL;
-
 }
 
-static void startSavedWiFiAttempt() {
+static bool startNextWiFiAttempt() {
+  // This guard is a second line of protection against the original bug:
+  // our own retry mechanism must never replace credentials during AP setup.
+  if (configPortalActive) {
+    Serial.println(F("WiFi retry skipped while setup portal is active."));
+    return false;
+  }
 
-  if (savedWiFiSSID.length() == 0) return;
+  if (wifiCandidateCount == 0) {
+    Serial.println(F("WiFi retry skipped: no configured networks."));
+    return false;
+  }
 
-  if (configPortalActive) WiFi.mode(WIFI_AP_STA);
+  if (wifiCandidateIndex >= wifiCandidateCount) wifiCandidateIndex = 0;
 
-  else WiFi.mode(WIFI_STA);
+  const uint8_t candidateIndex = wifiCandidateIndex;
+  const String ssid = wifiCandidates[candidateIndex].ssid;
+  const String password = wifiCandidates[candidateIndex].password;
+  wifiCandidateIndex = (candidateIndex + 1U) % wifiCandidateCount;
 
+  WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-
   WiFi.persistent(false);
 
-  Serial.print(F("Trying saved WiFi SSID: "));
+  // Clear the failed station attempt without erasing saved Preferences.
+  WiFi.disconnect(false, false);
+  delay(50);
 
-  Serial.println(savedWiFiSSID);
+  Serial.print(F("Trying WiFi candidate "));
+  Serial.print(candidateIndex + 1);
+  Serial.print(F("/"));
+  Serial.print(wifiCandidateCount);
+  Serial.print(F(": "));
+  Serial.println(ssid);
 
-  WiFi.begin(savedWiFiSSID.c_str(), savedWiFiPassword.c_str());
-
+  WiFi.begin(ssid.c_str(), password.c_str());
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-
   lastWiFiReconnectMs = millis();
-
+  return true;
 }
 
 static void startInitialWiFiAttempt() {
-
   if (!loadWiFiCredentialsFromNVS()) {
-
     startProvisioningPortal();
-
     return;
-
   }
 
   startWiFiOfflineTimer();
-
-  WiFi.mode(WIFI_STA);
-
-  WiFi.setAutoReconnect(true);
-
-  WiFi.persistent(false);
-
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
-
-  Serial.println(F("Starting initial saved WiFi connection..."));
-
-  WiFi.begin(savedWiFiSSID.c_str(), savedWiFiPassword.c_str());
-
-  lastWiFiReconnectMs = millis();
-
+  Serial.println(F("Starting first configured WiFi connection attempt..."));
+  startNextWiFiAttempt();
 }
 
 static void serviceWiFiProvisioning() {
-
   const uint32_t now = millis();
 
-  // Always process captive portal requests while the setup AP is active.
-
+  // When the AP is active, WiFiManager exclusively owns credential submission
+  // and connection attempts. Never re-apply an older SSID/password here.
   if (configPortalActive) {
-
     wifiManager.process();
 
-    // A connection may have succeeded using saved or newly submitted credentials.
-
     if (WiFi.status() == WL_CONNECTED) {
-
       wifiManager.stopConfigPortal();
-
       configPortalActive = false;
-
       onWiFiConnected();
-
       return;
-
     }
 
-    // Keep trying saved credentials while leaving AP active for the phone.
-
-    if (savedWiFiSSID.length() > 0 &&
-
-        (uint32_t)(now - lastWiFiReconnectMs) >= WIFI_RECONNECT_MS) {
-
-      Serial.println(F("AP is active; retrying saved WiFi credentials."));
-
-      startSavedWiFiAttempt();
-
-    }
-
-    // If the portal unexpectedly stops, fall back to STA and the timer
-
-    // will start the portal again if Wi-Fi is still unavailable.
-
+    // If the portal stopped unexpectedly, resume normal STA retries next.
     if (!wifiManager.getConfigPortalActive()) {
-
       configPortalActive = false;
-
       WiFi.mode(WIFI_STA);
-
       WiFi.setAutoReconnect(true);
-
-      Serial.println(F("Setup portal stopped."));
-
+      lastWiFiReconnectMs = millis();
+      Serial.println(F("Setup portal stopped while WiFi is still disconnected."));
     }
-
     return;
-
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-
     if (!wifiEverConnected) onWiFiConnected();
-
     else clearWiFiOfflineTimer();
 
+    // Retry the currently connected SSID first if the connection is later lost.
+    selectWiFiCandidateBySSID(WiFi.SSID());
     return;
-
   }
 
   if (!wifiOfflineTimerActive) startWiFiOfflineTimer();
 
-  // Requirement: after 30 seconds without a Wi-Fi connection, bring up AP.
-
+  // Start the setup AP after 30 seconds without a station connection.
   if ((uint32_t)(now - wifiOfflineSinceMs) >= WIFI_NO_CONNECTION_AP_MS) {
-
     startProvisioningPortal();
+    if (configPortalActive) return;
 
-    if (configPortalActive) {
-
-      // The AP remains up; the saved credentials will also be retried.
-
-      lastWiFiReconnectMs = now;
-
-      return;
-
-    }
-
-    // If starting the AP failed, retry its startup after another 30 seconds.
-
+    // If AP startup failed, retry its startup after another 30 seconds.
     wifiOfflineSinceMs = now;
-
     wifiOfflineTimerActive = true;
-
   }
 
-  // Retry saved credentials every 15 seconds, including on initial boot.
-
-  if (savedWiFiSSID.length() > 0 &&
-
+  // Try the saved network and then the three built-in networks in rotation.
+  if (wifiCandidateCount > 0 &&
       (uint32_t)(now - lastWiFiReconnectMs) >= WIFI_RECONNECT_MS) {
-
-    startSavedWiFiAttempt();
-
+    startNextWiFiAttempt();
   }
-
 }
 
 // ================================================================
@@ -2034,6 +2001,7 @@ static bool performBlynkAirOTA(const String& url) {
   http.setReuse(false);
 
   bool success = false;
+  bool updateSessionStarted = false;
 
   do {
 
@@ -2090,6 +2058,8 @@ static bool performBlynkAirOTA(const String& url) {
       break;
 
     }
+
+    updateSessionStarted = true;
 
     if (http.hasHeader("x-MD5")) {
 
@@ -2193,7 +2163,10 @@ static bool performBlynkAirOTA(const String& url) {
 
     }
 
-    if (!Update.end()) {
+    const bool updateEndOK = Update.end();
+    updateSessionStarted = false; // Update.end() closes/aborts its session on failure too.
+
+    if (!updateEndOK) {
 
       Serial.print(F("Update.end failed, error="));
 
@@ -2214,6 +2187,14 @@ static bool performBlynkAirOTA(const String& url) {
     success = true;
 
   } while (false);
+
+  // If download/flash writing stopped before Update.end(), abandon the open
+  // update transaction so a partial image cannot be treated as complete.
+  if (!success && updateSessionStarted) {
+    Update.abort();
+    updateSessionStarted = false;
+    Serial.println(F("Incomplete OTA transaction aborted."));
+  }
 
   http.end();
 
